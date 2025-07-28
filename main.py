@@ -15,7 +15,7 @@ app = Flask(__name__)
 scheduler = BackgroundScheduler()
 
 # List of target coins
-COINS = ['CFXUSDT', 'PNUTUSDT', 'PYTHUSDT', 'MBOXUSDT', 'BLURUSDT', 'JUPUSDT', 'ONEUSDT', 'AIUSDT', 'HSMTRUSDT']
+COINS = ['CFXUSDT', 'PNUTUSDT', 'PYTHUSDT', 'MBOXUSDT', 'BLURUSDT', 'JUPUSDT', 'ONEUSDT', 'AIUSDT', 'HMSTRUSDT']
 
 # Send a message to Telegram
 def notify_user(message):
