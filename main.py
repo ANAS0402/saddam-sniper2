@@ -1,111 +1,93 @@
-import json, os, requests, time, threading
-from flask import Flask
+import requests, time, threading
 from telegram import Bot
+from flask import Flask
+import logging
+import numpy as np
 
-# --- CONFIG ---
 TOKEN = "7831896600:AAG7MH7h3McjcG2ZVdkHDddzblxJABohaa0"
 CHAT_ID = "1873122742"
-WATCHLIST = ["CFX", "PNUT", "PYTH", "MBOX", "BLUR", "JUP", "ONE", "AI", "HSMTR"]
-HISTORY_FILE = "signal_memory.json"
-VOLATILITY_HISTORY = 10
 
-app = Flask(__name__)
 bot = Bot(token=TOKEN)
+app = Flask(__name__)
 
-# --- INIT HISTORY ---
-if not os.path.exists(HISTORY_FILE):
-    with open(HISTORY_FILE, "w") as f:
-        json.dump({}, f)
+COINS = ["CFXUSDT", "PYTHUSDT", "PYRUSDT", "MBOXUSDT", "HMSTRUSDT", "JUPUSDT", "BLURUSDT", "AIUSDT", "ONEUSDT", "PNUTUSDT"]
+BASE_URL = "https://api.binance.com/api/v3/"
 
-def load_memory():
-    with open(HISTORY_FILE, "r") as f:
-        return json.load(f)
+alerted = {}  # coin: last alert timestamp
 
-def save_memory(data):
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(data, f)
-
-def update_memory(symbol, result):
-    memory = load_memory()
-    if symbol not in memory:
-        memory[symbol] = {"results": [], "volatility": []}
-    memory[symbol]["results"].append(result)
-    memory[symbol]["results"] = memory[symbol]["results"][-20:]
-    save_memory(memory)
-
-def record_volatility(symbol, change):
-    memory = load_memory()
-    if symbol not in memory:
-        memory[symbol] = {"results": [], "volatility": []}
-    memory[symbol]["volatility"].append(abs(change))
-    memory[symbol]["volatility"] = memory[symbol]["volatility"][-VOLATILITY_HISTORY:]
-    save_memory(memory)
-
-def get_score(symbol):
-    memory = load_memory()
-    if symbol not in memory or not memory[symbol]["results"]:
-        return 0.0
-    results = memory[symbol]["results"]
-    return sum(results) / len(results)
-
-def get_volatility(symbol):
-    memory = load_memory()
-    if symbol not in memory or not memory[symbol]["volatility"]:
-        return 1.0
-    return sum(memory[symbol]["volatility"]) / len(memory[symbol]["volatility"])
-
-# --- SNIPER ENGINE ---
-def analyze(symbol):
+def get_klines(symbol, interval="1m", limit=100):
+    url = BASE_URL + "klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
-        url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}USDT"
-        data = requests.get(url, timeout=5).json()
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return [float(i[4]) for i in data]  # closing prices
+    except:
+        return None
 
-        price_change = float(data["priceChangePercent"])
-        volume = float(data["quoteVolume"])
-        last_price = float(data["lastPrice"])
-        symbol_score = get_score(symbol)
-        volatility = get_volatility(symbol)
+def market_regime(prices):
+    if not prices: return False
+    returns = np.diff(prices) / prices[:-1]
+    volatility = np.std(returns)
+    trend_strength = abs(prices[-1] - prices[0]) / prices[0]
+    return trend_strength > 0.01 and volatility > 0.003  # trend and action
 
-        # Add learning logic
-        raw_signal_strength = 0
-        if abs(price_change) > 1.2:
-            raw_signal_strength += 1
-        if volume > 1_000_000:
-            raw_signal_strength += 1
-        if symbol_score > 0.3:
-            raw_signal_strength += 1
-        if volatility > 5:
-            raw_signal_strength -= 1  # penalize wild coins
+def volume_breakout(symbol):
+    url = BASE_URL + "ticker/24hr"
+    try:
+        r = requests.get(url, params={"symbol": symbol}, timeout=5)
+        data = r.json()
+        vol_now = float(data["quoteVolume"])
+        price_now = float(data["lastPrice"])
+        change = float(data["priceChangePercent"])
+        return vol_now > 1_000_000 and abs(change) > 2.5
+    except:
+        return False
 
-        # Only alert if score is strong enough
-        if raw_signal_strength >= 2:
-            msg = f"⚡️ Signal for {symbol}\n" \
-                  f"Price Change: {price_change:.2f}%\n" \
-                  f"Volume: ${volume:,.0f}\n" \
-                  f"Score: {symbol_score:.2f}\n" \
-                  f"Volatility: {volatility:.2f}\n" \
-                  f"Last Price: {last_price}"
-            bot.send_message(chat_id=CHAT_ID, text=msg)
-            update_memory(symbol, 1)
-        else:
-            update_memory(symbol, 0)
+def calculate_conviction(prices):
+    if not prices: return 0
+    recent = prices[-10:]
+    trend = (recent[-1] - recent[0]) / recent[0]
+    returns = np.diff(recent) / recent[:-1]
+    vol = np.std(returns)
+    zscore = (recent[-1] - np.mean(recent)) / (np.std(recent) + 1e-9)
+    return (abs(trend) * 50 + vol * 100 + abs(zscore) * 30)  # out of ~180
 
-        record_volatility(symbol, price_change)
+def should_alert(symbol):
+    now = time.time()
+    if symbol in alerted and now - alerted[symbol] < 300:
+        return False
+    prices = get_klines(symbol)
+    if not market_regime(prices): return False
+    if not volume_breakout(symbol): return False
+    score = calculate_conviction(prices)
+    if score < 80: return False
+    alerted[symbol] = now
+    return True
 
-    except Exception as e:
-        print(f"Error analyzing {symbol}: {e}")
+def send_alert(symbol):
+    r = requests.get(BASE_URL + "ticker/price", params={"symbol": symbol})
+    data = r.json()
+    price = float(data["price"])
+    msg = f"🔥 Entry Alert: {symbol}\nPrice: {price:.4f}\nConviction: HIGH\nTime: {time.strftime('%H:%M:%S')}"
+    bot.send_message(chat_id=CHAT_ID, text=msg)
 
 def sniper_loop():
     while True:
-        for coin in WATCHLIST:
-            analyze(coin)
-            time.sleep(1)
-        time.sleep(10)
+        for coin in COINS:
+            try:
+                if should_alert(coin):
+                    send_alert(coin)
+            except Exception as e:
+                print(f"Error analyzing {coin}: {e}")
+        time.sleep(30)
 
-@app.route("/")
+@app.route('/')
 def home():
-    return "SADDAM SNIPER ADAPTIVE V2 is RUNNING 🧠"
+    return "🟢 SADDAM SNIPER RUNNING"
 
 if __name__ == "__main__":
+    logging.getLogger('werkzeug').disabled = True
     threading.Thread(target=sniper_loop).start()
-    app.run(host="0.0.0.0", port=3000)
+    app.run(host='0.0.0.0', port=3000)
