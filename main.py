@@ -1,34 +1,70 @@
-# main.py
-
-from flask import Flask
-from telegram import Bot
 import threading
 import time
-from strategy import *
-from config import TOKEN, CHAT_ID, SNIPER_PAIRS
+import requests
+from flask import Flask
+from telegram import Bot
+from apscheduler.schedulers.background import BackgroundScheduler
 
+# Your credentials
+BOT_TOKEN = '7831896600:AAG7MH7h3McjcG2ZVdkHDddzblxJABohaa0'
+CHAT_ID = '1873122742'
+
+# Initialize bot and Flask
+bot = Bot(token=BOT_TOKEN)
 app = Flask(__name__)
-bot = Bot(token=TOKEN)
+scheduler = BackgroundScheduler()
 
+# List of target coins
+COINS = ['CFXUSDT', 'PNUTUSDT', 'PYTHUSDT', 'MBOXUSDT', 'BLURUSDT', 'JUPUSDT', 'ONEUSDT', 'AIUSDT', 'HSMTRUSDT']
+
+# Send a message to Telegram
+def notify_user(message):
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=message)
+        print(f"[📨 Telegram] {message}")
+    except Exception as e:
+        print(f"[⚠️ Telegram Error] {e}")
+
+# Analyze individual coin
+def analyze_coin(symbol):
+    url = f'https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}'
+    try:
+        response = requests.get(url)
+        data = response.json()
+        if 'lastPrice' in data:
+            price = float(data['lastPrice'])
+            change = float(data['priceChangePercent'])
+
+            # Example sniper logic
+            if change >= 5:
+                notify_user(f"🚀 {symbol} is pumping! Price: {price} | Change: {change:.2f}%")
+            elif change <= -5:
+                notify_user(f"📉 {symbol} is dumping! Price: {price} | Change: {change:.2f}%")
+            else:
+                print(f"[ℹ️ {symbol}] Normal activity: {change:.2f}%")
+        else:
+            print(f"[⚠️ INVALID DATA] {symbol}: {data}")
+    except Exception as e:
+        print(f"[❌ Error] Failed to analyze {symbol}: {e}")
+
+# Loop to check all coins
 def sniper_loop():
     while True:
-        for symbol in SNIPER_PAIRS:
-            try:
-                candles = get_recent_candles(symbol)
-                if candle_analysis(candles) and volume_spike(candles) and depth_imbalance(symbol):
-                    message = f"🎯 SADDAM SIGNAL:\n{symbol} shows strong sniper conditions!"
-                    bot.send_message(chat_id=CHAT_ID, text=message)
-                    print(f"[✔️ ALERT] {symbol}")
-                else:
-                    print(f"[🔎 SCAN] {symbol} - No entry")
-            except Exception as e:
-                print(f"[⚠️ ERROR] {symbol}: {e}")
-        time.sleep(60)
+        for coin in COINS:
+            analyze_coin(coin)
+        time.sleep(60)  # Wait 60 seconds between each cycle
 
+# Flask route
 @app.route('/')
 def home():
-    return "SADDAM SNIPER ACTIVE 🧠"
+    return '✅ Saddam Sniper is running.'
 
-if __name__ == "__main__":
-    threading.Thread(target=sniper_loop).start()
+# Start sniper in background
+def start_bot():
+    threading.Thread(target=sniper_loop, daemon=True).start()
+    notify_user("🟢 Saddam Sniper has started.")
+
+# Start everything
+if __name__ == '__main__':
+    start_bot()
     app.run(host='0.0.0.0', port=3000)
