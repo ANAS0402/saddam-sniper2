@@ -1,88 +1,111 @@
-import requests
-import time
-from datetime import datetime, timedelta
-from telegram import Bot
+import json, os, requests, time, threading
 from flask import Flask
-import threading
+from telegram import Bot
 
-# --- YOUR BOT CONFIG ---
-TELEGRAM_TOKEN = "7831896600:AAG7MH7h3McjcG2ZVdkHDddzblxJABohaa0"
+# --- CONFIG ---
+TOKEN = "7831896600:AAG7MH7h3McjcG2ZVdkHDddzblxJABohaa0"
 CHAT_ID = "1873122742"
+WATCHLIST = ["CFX", "PNUT", "PYTH", "MBOX", "BLUR", "JUP", "ONE", "AI", "HSMTR"]
+HISTORY_FILE = "signal_memory.json"
+VOLATILITY_HISTORY = 10
 
-COINS = ["CFX", "PNUT", "PYTH", "MBOX", "BLUR", "JUP", "ONE", "AI", "HSMTR"]
-DROP_PERCENT = -6.0
-DROP_TIMEFRAME = 5
-VOLUME_SPIKE_X = 2.0
-WICK_THRESHOLD = 1.5
-COOLDOWN_MINUTES = 20
-
-last_alert_time = {}
 app = Flask(__name__)
-bot = Bot(token=TELEGRAM_TOKEN)
+bot = Bot(token=TOKEN)
 
-# Fetch 1m candles
-def fetch_klines(symbol):
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}USDT&interval=1m&limit=10"
-    return requests.get(url).json()
+# --- INIT HISTORY ---
+if not os.path.exists(HISTORY_FILE):
+    with open(HISTORY_FILE, "w") as f:
+        json.dump({}, f)
 
-# Analyze 5min drop + wick + volume
-def analyze_coin(symbol):
+def load_memory():
+    with open(HISTORY_FILE, "r") as f:
+        return json.load(f)
+
+def save_memory(data):
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(data, f)
+
+def update_memory(symbol, result):
+    memory = load_memory()
+    if symbol not in memory:
+        memory[symbol] = {"results": [], "volatility": []}
+    memory[symbol]["results"].append(result)
+    memory[symbol]["results"] = memory[symbol]["results"][-20:]
+    save_memory(memory)
+
+def record_volatility(symbol, change):
+    memory = load_memory()
+    if symbol not in memory:
+        memory[symbol] = {"results": [], "volatility": []}
+    memory[symbol]["volatility"].append(abs(change))
+    memory[symbol]["volatility"] = memory[symbol]["volatility"][-VOLATILITY_HISTORY:]
+    save_memory(memory)
+
+def get_score(symbol):
+    memory = load_memory()
+    if symbol not in memory or not memory[symbol]["results"]:
+        return 0.0
+    results = memory[symbol]["results"]
+    return sum(results) / len(results)
+
+def get_volatility(symbol):
+    memory = load_memory()
+    if symbol not in memory or not memory[symbol]["volatility"]:
+        return 1.0
+    return sum(memory[symbol]["volatility"]) / len(memory[symbol]["volatility"])
+
+# --- SNIPER ENGINE ---
+def analyze(symbol):
     try:
-        klines = fetch_klines(symbol)
-        if len(klines) < DROP_TIMEFRAME + 1:
-            return
+        url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}USDT"
+        data = requests.get(url, timeout=5).json()
 
-        closes = [float(k[4]) for k in klines[-DROP_TIMEFRAME-1:]]
-        highs = [float(k[2]) for k in klines[-DROP_TIMEFRAME-1:]]
-        lows = [float(k[3]) for k in klines[-DROP_TIMEFRAME-1:]]
-        volumes = [float(k[5]) for k in klines[-DROP_TIMEFRAME-1:]]
+        price_change = float(data["priceChangePercent"])
+        volume = float(data["quoteVolume"])
+        last_price = float(data["lastPrice"])
+        symbol_score = get_score(symbol)
+        volatility = get_volatility(symbol)
 
-        drop_pct = ((closes[-1] - closes[0]) / closes[0]) * 100
-        avg_volume = sum(volumes[:-1]) / len(volumes[:-1])
-        wick_size = ((highs[-1] - lows[-1]) / closes[-1]) * 100
+        # Add learning logic
+        raw_signal_strength = 0
+        if abs(price_change) > 1.2:
+            raw_signal_strength += 1
+        if volume > 1_000_000:
+            raw_signal_strength += 1
+        if symbol_score > 0.3:
+            raw_signal_strength += 1
+        if volatility > 5:
+            raw_signal_strength -= 1  # penalize wild coins
 
-        if (
-            drop_pct <= DROP_PERCENT and
-            volumes[-1] > avg_volume * VOLUME_SPIKE_X and
-            wick_size >= WICK_THRESHOLD and
-            cooldown_ok(symbol)
-        ):
-            msg = (
-                f"🚨 SNIPER ALERT\n\n"
-                f"💣 {symbol} dropped {drop_pct:.2f}% in {DROP_TIMEFRAME}min\n"
-                f"📊 Volume spike: {volumes[-1]:.2f} > avg {avg_volume:.2f}\n"
-                f"📈 Wick: {wick_size:.2f}%\n"
-                f"🕒 {datetime.now().strftime('%H:%M:%S')}\n\n"
-                f"https://www.tradingview.com/symbols/{symbol}USDT"
-            )
+        # Only alert if score is strong enough
+        if raw_signal_strength >= 2:
+            msg = f"⚡️ Signal for {symbol}\n" \
+                  f"Price Change: {price_change:.2f}%\n" \
+                  f"Volume: ${volume:,.0f}\n" \
+                  f"Score: {symbol_score:.2f}\n" \
+                  f"Volatility: {volatility:.2f}\n" \
+                  f"Last Price: {last_price}"
             bot.send_message(chat_id=CHAT_ID, text=msg)
-            last_alert_time[symbol] = datetime.now()
+            update_memory(symbol, 1)
+        else:
+            update_memory(symbol, 0)
+
+        record_volatility(symbol, price_change)
 
     except Exception as e:
-        print(f"[ERROR] {symbol}: {e}")
+        print(f"Error analyzing {symbol}: {e}")
 
-# Cooldown check
-def cooldown_ok(symbol):
-    last_time = last_alert_time.get(symbol)
-    if not last_time:
-        return True
-    return (datetime.now() - last_time) > timedelta(minutes=COOLDOWN_MINUTES)
-
-# Main scan loop
 def sniper_loop():
-    bot.send_message(chat_id=CHAT_ID, text="✅ Saddam Sniper activated and watching...")
     while True:
-        for coin in COINS:
-            analyze_coin(coin.upper())
+        for coin in WATCHLIST:
+            analyze(coin)
             time.sleep(1)
-        time.sleep(30)
+        time.sleep(10)
 
-# Web service (Render check)
-@app.route('/')
+@app.route("/")
 def home():
-    return "Saddam Sniper Running"
+    return "SADDAM SNIPER ADAPTIVE V2 is RUNNING 🧠"
 
-# Start
-if __name__ == '__main__':
+if __name__ == "__main__":
     threading.Thread(target=sniper_loop).start()
     app.run(host="0.0.0.0", port=3000)
