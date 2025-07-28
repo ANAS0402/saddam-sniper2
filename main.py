@@ -1,68 +1,93 @@
-import threading
-import time
 import requests
-from flask import Flask
+import time
+from datetime import datetime, timedelta
 from telegram import Bot
-from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask
+import threading
 
-# Your credentials
-BOT_TOKEN = '7831896600:AAG7MH7h3McjcG2ZVdkHDddzblxJABohaa0'
-CHAT_ID = '1873122742'
+# --- CONFIG ---
+TELEGRAM_TOKEN = "7831896600:AAG7MH7h3McjcG2ZVdkHDddzblxJABohaa0"
+CHAT_ID = "1873122742"
 
-# Initialize bot and Flask
-bot = Bot(token=BOT_TOKEN)
+COINS = ["CFX", "PNUT", "PYTH", "MBOX", "BLUR", "JUP", "ONE", "AI", "HSMTR"]
+DROP_PERCENT = -6.0  # % sudden drop
+DROP_TIMEFRAME = 5   # minutes
+VOLUME_SPIKE_X = 2.0
+WICK_THRESHOLD = 1.5  # price rebound after dump
+COOLDOWN_MINUTES = 20  # cooldown per coin
+
+# --- MEMORY TRACKER ---
+last_alert_time = {}
+
+# --- INIT ---
 app = Flask(__name__)
-scheduler = BackgroundScheduler()
+bot = Bot(token=TELEGRAM_TOKEN)
 
-# List of target coins
-COINS = ['CFXUSDT', 'PNUTUSDT', 'PYTHUSDT', 'MBOXUSDT', 'BLURUSDT', 'JUPUSDT', 'ONEUSDT', 'AIUSDT', 'HMSTRUSDT']
+# --- UTILITIES ---
+def fetch_klines(symbol):
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}USDT&interval=1m&limit=10"
+    r = requests.get(url)
+    return r.json()
 
-# Send a message to Telegram
-def notify_user(message):
-    try:
-        bot.send_message(chat_id=CHAT_ID, text=message)
-        print(f"[📨 Telegram] {message}")
-    except Exception as e:
-        print(f"[⚠️ Telegram Error] {e}")
-
-# Analyze individual coin
 def analyze_coin(symbol):
-    url = f'https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}'
     try:
-        response = requests.get(url)
-        data = response.json()
-        if 'lastPrice' in data:
-            price = float(data['lastPrice'])
-            change = float(data['priceChangePercent'])
+        klines = fetch_klines(symbol)
+        if len(klines) < DROP_TIMEFRAME + 1:
+            return
 
-            # Example sniper logic
-            if change >= 5:
-                notify_user(f"🚀 {symbol} is pumping! Price: {price} | Change: {change:.2f}%")
-            elif change <= -5:
-                notify_user(f"📉 {symbol} is dumping! Price: {price} | Change: {change:.2f}%")
-            else:
-                print(f"[ℹ️ {symbol}] Normal activity: {change:.2f}%")
-        else:
-            print(f"[⚠️ INVALID DATA] {symbol}: {data}")
+        closes = [float(k[4]) for k in klines[-DROP_TIMEFRAME-1:]]
+        highs = [float(k[2]) for k in klines[-DROP_TIMEFRAME-1:]]
+        lows = [float(k[3]) for k in klines[-DROP_TIMEFRAME-1:]]
+        volumes = [float(k[5]) for k in klines[-DROP_TIMEFRAME-1:]]
+
+        drop_pct = ((closes[-1] - closes[0]) / closes[0]) * 100
+        avg_volume = sum(volumes[:-1]) / len(volumes[:-1])
+        wick_size = ((highs[-1] - lows[-1]) / closes[-1]) * 100
+
+        if (
+            drop_pct <= DROP_PERCENT and
+            volumes[-1] > avg_volume * VOLUME_SPIKE_X and
+            wick_size >= WICK_THRESHOLD and
+            cooldown_ok(symbol)
+        ):
+            msg = (
+                f"🚨 SNIPER ALERT\n\n"
+                f"💣 {symbol} dropped {drop_pct:.2f}% in {DROP_TIMEFRAME}min\n"
+                f"📊 Volume spike: {volumes[-1]:.2f} > avg {avg_volume:.2f}\n"
+                f"📈 Wick: {wick_size:.2f}%\n"
+                f"🕒 {datetime.now().strftime('%H:%M:%S')}\n\n"
+                f"https://www.tradingview.com/symbols/{symbol}USDT"
+            )
+            bot.send_message(chat_id=CHAT_ID, text=msg)
+            last_alert_time[symbol] = datetime.now()
+
     except Exception as e:
-        print(f"[❌ Error] Failed to analyze {symbol}: {e}")
+        print(f"[ERROR] {symbol}: {e}")
 
-# Loop to check all coins
+def cooldown_ok(symbol):
+    last_time = last_alert_time.get(symbol)
+    if not last_time:
+        return True
+    return (datetime.now() - last_time) > timedelta(minutes=COOLDOWN_MINUTES)
+
+# --- LOOP ---
 def sniper_loop():
     while True:
         for coin in COINS:
-            analyze_coin(coin)
-        time.sleep(60)  # Wait 60 seconds between each cycle
+            analyze_coin(coin.upper())
+            time.sleep(1)
+        time.sleep(30)
 
-# Flask route
+# --- WEB ---
 @app.route('/')
 def home():
-    return '✅ Saddam Sniper is running.'
+    return "Saddam Sniper Running"
 
-# Start sniper in background
-def start_bot():
-    threading.Thread(target=sniper_loop, daemon=True).start()
-    notify_user("🟢 Saddam Sniper has started.")
+# --- START ---
+if __name__ == '__main__':
+    threading.Thread(target=sniper_loop).start()
+    app.run(host="0.0.0.0", port=3000)
+
 
 # Start everything
 if __name__ == '__main__':
